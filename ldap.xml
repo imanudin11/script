@@ -1,0 +1,18 @@
+<zimbraDirSync>
+    <masterURL>ldap://10.10.180.10:389</masterURL>
+    <masterFilter>objectClass=*</masterFilter>
+    <masterSearchBase>ou=People,dc=bppt,dc=go,dc=id</masterSearchBase>
+    <masterBindUser>cn=adminbppt,dc=bppt,dc=go,dc=id</masterBindUser>
+    <masterBindPassword>ldapbppt</masterBindPassword>
+    <masterBindTimeout>200</masterBindTimeout>
+    <logLevel>2</logLevel>
+    <localIgnore type="smtp">admin@bppt.go.id</localIgnore>
+    <masterIgnore type="smtp">admin@bppt.go.id</masterIgnore>
+    <localPassword type="attribute">userPassword</localPassword>
+    <localDeleteAdmin>false</localDeleteAdmin>
+    <requiredMasterAttribute attr="uid"/>
+        <localCos>default</localCos>
+        <attributeMap>
+        <attr local="displayName" master="cn"/>
+    </attributeMap>
+</zimbraDirSync>
