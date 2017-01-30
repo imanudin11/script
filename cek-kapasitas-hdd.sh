@@ -12,7 +12,7 @@ if [ "$CURRENT" -gt "$THRESHOLD" ] ; then
 
 DARI="from:report@imanudin.com”;
 TUJUAN="to:monitoring@imanudin.com";
-SALINAN="cc:admin@ imanudin.com";
+SALINAN="cc:admin@imanudin.com";
 SERVER=`hostname -f`;
 KAPASITAS=`df -h`;
 SUBJECT="Subject: [PEMBERITAHUAN] : Kapasitas HDD $SERVER sudah mencapai $CURRENT%"
