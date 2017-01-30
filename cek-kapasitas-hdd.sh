@@ -10,7 +10,7 @@ THRESHOLD=80
 
 if [ "$CURRENT" -gt "$THRESHOLD" ] ; then
 
-DARI="from:report@imanudin.com”;
+DARI="from:report@imanudin.com";
 TUJUAN="to:monitoring@imanudin.com";
 SALINAN="cc:admin@imanudin.com";
 SERVER=`hostname -f`;
@@ -33,6 +33,6 @@ echo "$TUJUAN" >> /tmp/hdd.txt
 echo "$SALINAN" >> /tmp/hdd.txt
 echo "$SUBJECT" >> /tmp/hdd.txt
 echo "$BODY" >> /tmp/hdd.txt
-cat /tmp/hdd.txt | /opt/zimbra/postfix/sbin/sendmail -t
+cat /tmp/hdd.txt | $SENDMAIL -t
 fi
 echo "Pemakaian kapasitas HDD belum mencapai $THRESHOLD%"
