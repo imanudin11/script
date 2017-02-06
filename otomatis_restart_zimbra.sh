@@ -192,6 +192,8 @@ $STATUS2
 Terima Kasih
 AI -> Ahmad Imanudin not Artificial Intelligence :D
 "
+# Lokasi Sendmail
+SENDMAIL=$(ionice -c3 find /opt/zimbra/ -type f -iname sendmail)
 # Kirim email
 echo "$DARI" > /tmp/statusservicezimbra.txt
 echo "$TUJUAN" >> /tmp/statusservicezimbra.txt
@@ -201,6 +203,6 @@ echo "$BODY1" >> /tmp/statusservicezimbra.txt
 echo "" >> /tmp/statusservicezimbra.txt
 echo "$BODY2" >> /tmp/statusservicezimbra.txt
 
-cat /tmp/statusservicezimbra.txt | /opt/zimbra/postfix/sbin/sendmail -t
+cat /tmp/statusservicezimbra.txt | $SENDMAIL -t
 fi
 echo "Status service Zimbra $ZCS aman"
