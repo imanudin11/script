@@ -194,6 +194,7 @@ AI -> Ahmad Imanudin not Artificial Intelligence :D
 "
 # Lokasi Sendmail
 SENDMAIL=$(ionice -c3 find /opt/zimbra/ -type f -iname sendmail)
+
 # Kirim email
 echo "$DARI" > /tmp/statusservicezimbra.txt
 echo "$TUJUAN" >> /tmp/statusservicezimbra.txt
