@@ -37,7 +37,6 @@ dnsbl.inps.de
 dnsbl.sorbs.net
 drone.abuse.ch
 drone.abuse.ch
-dnsbl.ahbl.org
 duinv.aupads.org
 dul.dnsbl.sorbs.net
 dul.ru
