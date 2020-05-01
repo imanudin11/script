@@ -10,7 +10,7 @@ echo -e "#                               www.imanudin.net                       
 echo -e "##########################################################################"
 
 echo ""
-echo -e "Make sure you have internet connection to install package..."
+echo -e "Make sure you have internet connection to install packages..."
 echo ""
 echo -e "Press key enter"
 read presskey
@@ -63,7 +63,7 @@ systemctl disable postfix
 
 yum update -y
 yum upgrade -y
-yum -y install perl perl-core wget screen w3m elinks openssh-clients openssh-server bind bind-utils unzip nmap sed nc sysstat libaio rsync telnet aspell
+yum -y install perl perl-core wget screen w3m elinks openssh-clients openssh-server bind bind-utils unzip nmap sed nc sysstat libaio rsync telnet aspell net-tools
 
 # Restart Network
 service network restart
@@ -105,6 +105,9 @@ echo "@		IN	NS	ns1.$DOMAIN." >> /var/named/db.$DOMAIN
 echo "@		IN	MX	0 $HOSTNAME.$DOMAIN." >> /var/named/db.$DOMAIN
 echo "ns1	IN	A	$IPADDRESS" >> /var/named/db.$DOMAIN
 echo "$HOSTNAME	IN	A	$IPADDRESS" >> /var/named/db.$DOMAIN
+
+# Insert localhost as the first Nameserver
+sed -i '1 s/^/nameserver 127.0.0.1\n/' /etc/resolv.conf
 
 # Restart Service & Check results configuring DNS Server
 
