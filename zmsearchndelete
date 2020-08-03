@@ -1,0 +1,962 @@
+#!/usr/bin/perl
+#
+# ***** BEGIN LICENSE BLOCK *****
+# Zimbra Collaboration Suite Server
+# Copyright (C) 2009, 2018 Synacor, Inc.
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software Foundation,
+# version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License along with this program.
+# If not, see <https://www.gnu.org/licenses/>.
+# ***** END LICENSE BLOCK *****
+
+# TBD: need these options/capabilities?
+#    --proc <procnum>       number of child processes allowed (4)
+
+=head1 NAME
+
+zmsearchndelete - Search messages with specified string and delete it
+
+=head1 SYNOPSIS
+
+zmsearchndelete [options] [<userlistfile> ...]
+
+  Options: [*] == Required, [+] == Multiple vals OK, (val) == Default
+    --url <url>               [*]URL of soap service
+    --authuser <user>         [*]account for authentication
+    --password <password>     [*]password for authuser
+    --query                   [*]search string specified in "" boundary
+    --account <acct>          [+]account to include
+    --exclude <acct>          [+]account to exclude
+    --exclude-file <file>     [+]file listing accounts to exclude
+    --searchdirectory <filt>  ldap filter to search for accounts
+    --go                      execute delete operation on matched messages
+    --noadminauth             report on the mailbox of --authuser only
+    --help                    display a brief help message
+    --man                     display the entire man page
+    --debug                   verbose output useful for debugging
+
+=head1 EXAMPLES
+
+  # search and delete messages with "invoice number*" string for all users
+  $ zmsearchndelete --url https://localhost:7071/service/admin/soap/ \
+     --authuser admin@test.loc --password password \
+     --query "invoice number*" --searchdirectory 'mail=*'
+
+  # only search messages with "hrishi" string for phil@test.loc
+  $ zmsearchndelete --url https://localhost:7071/service/admin/soap/ \
+     --authuser admin@test.loc --password password \
+     --query "hrishi" --account phil@test.loc 
+
+  # report on all mailboxes specified in input file except phil@test.loc
+  $ zmsearchndelete --url https://localhost:7071/service/admin/soap/ \
+     --authuser admin@test.loc --password password \
+     --query "hrishi" --exclude phil@test.loc <input file>
+
+=head1 DESCRIPTION
+
+This utility is used to search particular string in messages for the
+specified account(s).
+It can be used to delete these messages on request.
+It uses the ZCS Admin SOAP APIs
+
+Specifically, this utility was created to meet the following
+requirements:
+
+=over 4
+
+=item *
+
+Generate a search report based on string for all/selected users. 
+This is done by specifying --query and one of the user list options
+
+=item *
+
+On request delete these messages from your mailbox
+this can be done by specifying --go option
+
+=back
+
+=head1 Options
+
+The section describes supported options.  The following key is used to
+indicates required arguments, arguments which can be supplied multiple
+times, etc.:
+
+  [*]   == Required
+  [+]   == Multiple vals OK
+
+=over 4
+
+=item --url <url>
+
+[*] URL of soap service.  The following are examples of URLs that
+would typically be used.
+
+Examples:
+
+  (admin account) https://localhost:7071/service/admin/soap/
+  (non-admin use) http://localhost/service/soap/
+
+=item --authuser <user>
+
+[*] Account used for authentication.  Typically this will be an
+administrator account.  When combined with the --noadminauth option
+then this tool reports on only this account/mailbox and in this case
+use of --account, --searchdirectory or <userlistfile> is not allowed.
+
+=item --password <password>
+
+[*] Password for authuser account.
+
+=item --query <"string">
+
+[*] String to search messages for. 
+Note: string should be specified in "" boundary
+
+Examples:
+
+   "invoice number"
+   "zimbra*"
+   "is:anywhere after:01/01/2009 before:12/31/2009" 
+       : this will search messages in given date range
+   
+=item --account <acct>
+
+[+] Account(s) to include in the report.  This option is not allowed
+when using the --noadminauth option.
+
+=item --exclude <acct>
+
+[+] Account(s) to exclude from the report.
+
+=item --exclude-file <file>
+
+[+] File(s) listing accounts to exclude from the report.
+See also L<Input File Format>.
+
+=item --searchdirectory <filt>
+
+LDAP filter used to search the directory for accounts.  The search is
+performed via ZCS Admin SOAP SearchDirectoryRequest and uses the
+default 'types=accounts' to only match accounts.  This option is not
+allowed when using the --noadminauth option.
+
+Examples:
+
+   'mail=user1@domain.com'      : single user
+   'mail=*@domain.com'          : All users in domain.com
+   'mail=*'                     : All users on server
+
+=item --go
+
+To execute 'Message Delete' operation on searched messages
+
+=item --noadminauth
+
+Used to report on a single (typically non-admin) mailbox.  The mailbox
+to report on is indicated by the --authuser argument and the use of
+--account, --searchdirectory or <userlistfile> is not allowed when
+using this option.
+
+=item --help
+
+Display a brief help message.
+
+=item --man
+
+Display the entire man page.
+
+=item --debug [<level>]
+
+Verbose output useful for debugging.  An optional B<level> integer can
+be provided to increase debugging output.  By default the level will
+be set to 1 with the highest possible debugging level currently being
+3.
+
+=item <userlistfile>
+
+[+] File(s) listing accounts to report on.  This option is not allowed
+when using the --noadminauth option.
+
+See also L<Input File Format> on man page.
+
+=back
+
+=cut
+
+use strict;
+use warnings;
+use Benchmark qw(timediff timestr);
+use Carp ();
+use Date::Manip qw(DateCalc Date_Init Date_WeekOfYear UnixDate);
+use File::Basename qw(basename dirname fileparse);
+use Getopt::Long qw(GetOptions);
+use IO::File qw();
+use Pod::Usage qw(pod2usage);
+use POSIX ();
+use LWP::UserAgent;
+use IO::Socket::SSL;
+use Data::Dumper;
+
+$ENV{PERL_LWP_SSL_VERIFY_HOSTNAME} = 0;
+my $bot = LWP::UserAgent->new( 
+    env_proxy => 1, 
+    keep_alive => 1, 
+    timeout => 300, 
+    ssl_opts => { 
+        verify_hostname => 0, 
+        SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE 
+    },
+); 
+
+
+use lib qw(/opt/zimbra/zimbramon/lib/);
+use SOAP::Lite ();
+use Data::Dumper qw(Dumper);
+
+use constant {
+    NS_ZADMIN   => "urn:zimbraAdmin",
+    NS_ZACCOUNT => "urn:zimbraAccount",
+    NS_ZIMBRA   => "urn:zimbra",
+    NS_ZMAIL    => "urn:zimbraMail",
+};
+
+my $DEBUG   = 0;              # GLOBAL set by process_options()
+my $VERSION = "1.01";
+my $Prog    = basename($0);
+$|++;
+
+# make process resilient to some signals
+# $SIG{HUP} = $SIG{INT} = "IGNORE";
+
+main();
+
+# main program
+sub main {
+
+    my %Opt = process_options();
+
+    my $tStart = Benchmark->new;
+    warn( "$Prog: info: started ", _ts(), "\n" );
+
+    SOAP::Lite->import( $DEBUG > 2 ? ( +trace => [qw(debug)] ) : () );
+    SOAP::Lite->soapversion("1.2");
+
+    # ->autotype(0): ZCS (internal proxy) servers seem slightly
+    #   broken, use to avoid error like:
+    #   The prefix "xsi" for attribute "xsi:type" associated with an
+    #   element type "account" is not bound.
+    #
+    # ->readable(1): make xml easier to read when debugging
+    my $soap = SOAP::Lite->proxy( $Opt{url} )->autotype(0);
+
+    my @aargs = ( { soap => $soap }, $Opt{authuser}, $Opt{password} );
+    my $resp = $Opt{noadminauth} ? do_auth(@aargs) : do_adminauth(@aargs);
+    my $ainfo = auth_info( resp => $resp );
+
+    my $sdat;
+    if ( $Opt{searchdirectory} ) {
+        $sdat = searchdirectory( { soap => $soap, head => $ainfo->{header} },
+            $Opt{searchdirectory} );
+        warn( "DEBUG: searchdirectory accounts matched: ",
+            scalar(@$sdat), "\n" )
+          if ( $DEBUG > 1 );
+    }
+
+    my $excl = load_accounts( $Opt{exclude}, @{ $Opt{"exclude-file"} || [] } );
+    my $accts =
+      load_accounts( { exclude => $excl }, $Opt{account}, $sdat, @ARGV );
+
+    die("$Prog: ERROR: no accounts to search!\n") unless @$accts;
+
+    warn( "$Prog: info: total accounts: ", scalar @$accts, "\n" );
+
+    # define query for searching through mailboxes
+    my $query = $Opt{query};
+    warn("$Prog: info: query: $query\n");
+
+    # gather data
+    warn( "$Prog: info: searching messages now: ", _ts(), "\n" );
+    my $data = getmboxdata(
+        {
+            soap        => $soap,
+            ainfo       => $ainfo,
+            noadminauth => $Opt{noadminauth}
+        },
+        $query, $accts
+    );
+
+    # report and delete searched messages
+    warn( "$Prog: info: processing searched messages now: ", _ts(), "\n" );
+    my $cnt = reportndelete(
+        {
+            soap        => $soap,
+            ainfo       => $ainfo,
+            noadminauth => $Opt{noadminauth}
+        },
+        $data,
+        $Opt{go}
+    );
+
+    my $msg = "$Prog: info: Total messages found";
+    if ( $Opt{go} ) {
+        $msg .= " and deleted";
+    }
+    $msg .= " for given query: $cnt";
+    warn("$msg \n");
+
+    my $tEnd = Benchmark->new;
+
+    warn( "$Prog: info: finished ", _ts(), "\n" );
+    warn( "$Prog: info: took ", timestr( timediff( $tEnd, $tStart ) ), "\n" );
+}
+
+################################################################################
+# subroutines
+
+# process_options will die via pod2usage on errors
+sub process_options {
+    my ( %Opt, @err );
+    GetOptions(
+        \%Opt,             "url=s",
+        "authuser=s",      "password=s",
+        "account=s@",      "exclude=s@",
+        "exclude-file=s@", "query=s",
+        "noadminauth",     "searchdirectory=s",
+        "help",            "man",
+        "debug:1",         "go",
+    ) or pod2usage( -verbose => 0 );
+
+    pod2usage( -message => "$Prog: version $VERSION\n", -verbose => 1 )
+      if ( $Opt{help} );
+    pod2usage( -verbose => 2 ) if ( $Opt{man} );
+
+    # set global DEBUG
+    $DEBUG = $Opt{debug} || 0;
+
+    foreach my $arg (qw(url authuser password query)) {
+        push( @err, "--$arg is required" ) if ( !$Opt{$arg} );
+    }
+
+    # special handling for --noadminauth and related account options
+    my $acctopts = "use of --account, --searchdirectory or <userlistfile>";
+    if ( $Opt{noadminauth} ) {
+        push( @err, "$acctopts is not supported with --noadminauth" )
+          if ( $Opt{account} or @ARGV or $Opt{searchdirectory} );
+
+        # for --noadminauth only allow/support searching that mailbox
+        $Opt{account} = [ $Opt{authuser} ] if $Opt{authuser};
+    }
+    else {
+        push( @err, "$acctopts is required" )
+          unless ( $Opt{account} or @ARGV or $Opt{searchdirectory} );
+    }
+
+    push( @err, "try --help option for more information" ) if (@err);
+
+    pod2usage(
+        -verbose => 0,
+        -message => join( "", map( "$Prog: $_\n", @err ) )
+    ) if (@err);
+
+    warn("$Prog: info: use '--go' option to actually DELETE matched messages\n")
+      unless ( $Opt{go} );
+
+    return %Opt;
+}
+
+# report search messages and delete it if --go is specified
+sub reportndelete {
+
+    my $opt = ( ref( $_[0] ) eq "HASH" ) ? shift : {};
+    my ( $rpt_data, $go ) = @_;
+
+    my ( $soap, $ainfo ) = @{$opt}{qw(soap ainfo)};
+    my ($noadminauth) = @{$opt}{qw(noadminauth)};
+    my $ahdr = $ainfo->{header};
+    my ( $dhdr, $msg_cnt );
+    warn(
+        "------------------------
+    1:Account\t2:MSG_ID\t3:CONV_ID\t4:DATE(mm/dd/yy)\t5:FROM\t6:SIZE(Bytes)\n"
+    );
+
+    #report searched message details
+    foreach my $acct ( sort keys(%$rpt_data) ) {
+        my @msg_ids;
+        my $msgs = $rpt_data->{$acct};
+        my $msgc = scalar(@$msgs);
+        $msg_cnt += $msgc;
+
+        warn("DEBUG: messages found in account: $acct : $msgc\n")
+          if ( $DEBUG > 0 );
+
+        if ($msgc) {
+            warn("------------------------\n");
+            foreach my $d (@$msgs) {
+
+                my $date = _date( $d->{d} );
+
+                # In testing, for very recently sent/received messages 'from' field
+                # is not getting populated instantaneously. It gets populated in
+                # next try or if 1st try is delayed by some time (?min) after mail sent
+                $d->{from} = "NA" unless ( defined( $d->{from} ) );
+
+                warn(
+                    "$acct\t\t$d->{id}\t$d->{cid}\t$date\t$d->{from}\t$d->{s}\n"
+                );
+
+                # create message ids string for MsgActionRequest (op=delete) SOAP CALL
+                push @msg_ids, $d->{id} if ($go);
+            }
+
+            # execute 'delete messages' if --go option is specified
+            if ($go) {
+                if ($noadminauth) {
+                    $dhdr = $ahdr;
+                }
+                else {
+                    my $dinfo =
+                      delegateauth_info( { soap => $soap, head => $ahdr },
+                        name => $acct );
+                    $dhdr = $dinfo->{header};
+                }
+                if (@msg_ids && $#msg_ids >= 0) {
+                    delmsgs( { soap => $soap, head => $dhdr }, $acct, @msg_ids );
+                }
+            }
+        }
+    }
+    warn("------------------------\n");
+    return $msg_cnt;
+}
+
+# delmsgs( { soap => $soap, head => $dhdr }, $acct, @msg_ids )
+sub delmsgs {
+
+    my $opt = ( ref( $_[0] ) eq "HASH" ) ? shift : {};
+    my ( $acct, @msg_ids ) = @_;
+
+    warn( "DEBUG: Deleting messages from account: $acct: ", _ts(), "\n" )
+      if ( $DEBUG > 0 );
+    warn("DEBUG: Message_IDs: @msg_ids\n") if ( $DEBUG > 1 );
+
+    my $body =
+      [ SOAP::Data->name("action")->attr( { op => "delete", id => join(",", @msg_ids) } ) ];
+    my $attr = { xmlns => NS_ZMAIL, };
+
+    # NOTE: use fully qualified path for speed!
+    my $path = "/Envelope/Body/MsgActionResponse";    # "//MsgActionResponse";
+    do {
+        my $som = call_soap(
+            %$opt,
+            req  => "MsgActionRequest",
+            attr => $attr,
+            body => $body
+        );
+      }
+}
+
+# NOTE: request is only allowed for admin accounts via admin interface!
+# searchdirectory( { soap => $soap, head => $ahdr }, $filter )
+sub searchdirectory {
+    my $opt = ( ref( $_[0] ) eq "HASH" ) ? shift : {};
+    my ($query) = @_;
+
+    my $body = [ SOAP::Data->name( "query" => $query ) ];
+
+    # NOTE: a large limit can make XML parsing very slow!
+    my $limit = 50;
+    my $attr  = {
+        xmlns      => NS_ZADMIN,
+        types      => "accounts",
+        limit      => $limit,
+        attrs      => "mail",
+        applyCos   => 0,
+        maxResults => 0,
+    };
+
+    # NOTE: use fully qualified path for speed!
+    my $data = [];
+    my $path = "/Envelope/Body/SearchDirectoryResponse";
+    my $more;
+    do {
+        my $som = call_soap(
+            %$opt,
+            req  => "SearchDirectoryRequest",
+            attr => $attr,
+            body => $body
+        );
+        $more = $som->dataof($path)->attr->{more};
+        $attr->{offset} += $limit;
+
+        my $i = 0;
+        foreach my $acc ( $som->dataof("$path/account") ) {
+
+            # $msom is used to restrict search for values
+            $i++;
+            my $msom = $som->match("$path/[$i]")
+              or die("MATCH '$path/[$i]' failed\n");
+
+            # attrs: name=<email>, id=<id>
+            my $attr = $acc->attr;
+            push( @$data, $attr->{name} );
+        }
+    } until ( !$more );
+
+    return $data;
+}
+
+# <m ... f="{flags}" s="{size}" d="{date}" ...>
+#   <e .../>*  <!- from only -->
+#   ...
+# </m>
+#
+# {size}  = size in bytes
+# {flags} = (u)nread, (f)lagged, has (a)ttachment, (r)eplied,
+#           (s)ent by me, for(w)arded, calendar in(v)ite, (d)raft,
+#           IMAP-\Deleted(x), (n)otification sent, urgent(!), low-priority(?)
+# {date}  = secs since epoch, from date header in message
+# <e .../>* = zero or more addrs in the msg, indentified by type (t="f|t|c")
+
+# searchmbox( { soap => $soap, head => $ahdr }, $query, $data )
+sub searchmbox {
+    my $opt = ( ref( $_[0] ) eq "HASH" ) ? shift : {};
+    my ( $query, $data ) = @_;
+
+    my $msgc = scalar(@$data);
+    my $body = [ SOAP::Data->name( "query" => $query ) ];
+
+    # NOTE: a large limit like 1000 can make XML parsing very slow!
+    my $limit = 200;
+    my $attr  = {
+        xmlns  => NS_ZMAIL,
+        types  => "message",
+        sortby => "dateAsc",
+        limit  => $limit,
+    };
+
+    # NOTE: use fully qualified path for speed!
+    my $path = "/Envelope/Body/SearchResponse";    # "//SearchResponse";
+    my $more;
+    do {
+        my $som = call_soap(
+            %$opt,
+            req  => "SearchRequest",
+            attr => $attr,
+            body => $body
+        );
+        $more = $som->dataof($path)->attr->{more};
+        $attr->{offset} += $limit;
+
+        my $i = 0;
+        foreach my $msg ( $som->dataof("$path/m") ) {
+
+            # $msom is used to restrict search for values
+            $i++;
+            my $msom = $som->match("$path/[$i]")
+              or die("MATCH '$path/[$i]' failed\n");
+
+            # attrs: d="date", f="flags", s="size" id="message id" cid="conv id"
+            my $attr = $msg->attr;
+            my $rec = { map { $_ => $attr->{$_} } qw(id cid d s) };
+
+            # convert ms to s
+            $rec->{d} = $rec->{d} / 1000;
+
+            # values: e="from" -- there should be *only* one, ensure lowercase
+            my $cnt = 0;
+            foreach my $e ( $msom->dataof("e") ) {
+                die("more than 1 'from' address found!\n") if ( ++$cnt > 1 );
+                $rec->{from} = lc( $e->attr->{a} );
+            }
+
+            push( @$data, $rec );
+        }
+    } until ( !$more );
+
+    # return number of additional messages placed in $data
+    return scalar(@$data) - $msgc;
+}
+
+# getmboxdata( { soap => $soap, ainfo => $ainfo }, $query, $accts );
+sub getmboxdata {
+    my $opt = ( ref( $_[0] ) eq "HASH" ) ? shift : {};
+    my ( $query, $accts ) = @_;
+
+    my ( $soap, $ainfo ) = @{$opt}{qw(soap ainfo)};
+
+    #my ( $noadminauth, $regexsub ) = @{$opt}{qw(noadminauth regexsub)};
+    my ($noadminauth) = @{$opt}{qw(noadminauth)};
+    my $ahdr = $ainfo->{header};
+
+    my ( %data, $dhdr, $dest );
+    foreach my $acct (@$accts) {
+
+        if ($noadminauth) {
+            $dhdr = $ahdr;
+        }
+        else {
+            my $dinfo = delegateauth_info( { soap => $soap, head => $ahdr },
+                name => $acct );
+            $dhdr = $dinfo->{header};
+        }
+
+        # translate $acct using subref if $regexsub was set
+        $dest = $acct;
+
+        #$dest = $regexsub->($acct) if $regexsub;
+
+        warn("$Prog: WARN: merging '$acct' with '$dest'!\n")
+          if ( exists $data{$dest} );
+
+        # message data is appended to $msgs by searchmbox!
+        my $msgs = $data{$dest} || [];
+        my $rc = searchmbox( { soap => $soap, head => $dhdr }, $query, $msgs );
+        $data{$dest} = $msgs;
+
+        warn("DEBUG: messages found in $acct: $rc\n")
+          if ( $DEBUG > 1 );
+    }
+    return \%data;
+}
+
+# delegateauth_info( { soap => $soap, auth => $ainfo }, name => $acct );
+sub delegateauth_info {
+    my ( $opt, @args ) = @_;
+
+    my $resp = do_delegateauth(@_);
+    my $soap = $opt->{soap};
+    my $hdr  = auth_info( resp => $resp );
+
+    # use call to get sessionId will also identify bad accounts...
+    $resp = do_getinfo( { soap => $soap, head => $hdr->{header} }, "mbox" );
+
+    return auth_info( resp => $resp, token => $hdr->{token} );
+}
+
+# do_adminauth( { soap => $soap }, $Opt{authuser}, $Opt{password} );
+sub do_adminauth {
+    my $opt = ( ref( $_[0] ) eq "HASH" ) ? shift : {};
+    my ( $name, $password ) = @_;
+
+    my $head = SOAP::Header->name("context")->attr( { xmlns => NS_ZADMIN } );
+    my $body = [
+        SOAP::Data->name( name     => $name ),
+        SOAP::Data->name( password => $password ),
+    ];
+
+    return call_soap(
+        %$opt,
+        req  => "AuthRequest",
+        attr => { xmlns => NS_ZADMIN },
+        head => $head,
+        body => $body
+    );
+}
+
+# do_auth( { soap => $soap }, $Opt{account}, $Opt{password} );
+sub do_auth {
+    my $opt = ( ref( $_[0] ) eq "HASH" ) ? shift : {};
+    my ( $acct, $password ) = @_;
+
+    my $head = SOAP::Header->name("context")->attr( { xmlns => NS_ZIMBRA } );
+    my $body = [
+        SOAP::Data->name( account  => $acct )->attr( { by => "name" } ),
+        SOAP::Data->name( password => $password ),
+    ];
+
+    return call_soap(
+        %$opt,
+        req  => "AuthRequest",
+        attr => { xmlns => NS_ZACCOUNT },
+        head => $head,
+        body => $body
+    );
+}
+
+# do_delegateauth( { soap => $soap }, "id|name" => $acct );
+sub do_delegateauth {
+    my $opt = ( ref( $_[0] ) eq "HASH" ) ? shift : {};
+    my ( $by, $acct ) = @_;
+
+    my $body = [ SOAP::Data->name( account => $acct )->attr( { by => $by } ), ];
+
+    return call_soap(
+        %$opt,
+        req  => "DelegateAuthRequest",
+        attr => { xmlns => NS_ZADMIN },
+        body => $body
+    );
+}
+
+# do_getinfo( { soap => $soap, head => $ahdr }, $sections )
+sub do_getinfo {
+    my $opt = ( ref( $_[0] ) eq "HASH" ) ? shift : {};
+    my ($sections) = @_;
+
+    my $attr = { xmlns => NS_ZACCOUNT };
+    $attr->{sections} = $sections if $sections;
+
+    # ZCS http/soap proxy chokes on requests if SOAP::Data uses xsi:nil="true"
+    my $body = [ [] ];
+
+    return call_soap(
+        %$opt,
+        req  => "GetInfoRequest",
+        attr => $attr,
+        body => $body
+    );
+}
+
+sub call_soap {
+    my %opt = @_;
+
+    # die on errors by default
+    unless ( exists $opt{RaiseError} or exists $opt{PrintError} ) {
+        $opt{RaiseError} = 1;
+    }
+
+    my $handler =
+        $opt{RaiseError} ? sub { die(@_) }
+      : $opt{PrintError} ? sub { warn(@_) }
+      :                    undef;
+
+    my $soap = $opt{soap};
+    my $req  = SOAP::Data->name( $opt{req} );
+    $req->attr( $opt{attr} ) if $opt{attr};
+
+    my $resp;
+    my ( $try, $maxtry, $sleep ) = ( 0, 3, 0 );
+    while ( !$resp && $try++ < $maxtry ) {
+        eval { $resp = $soap->call( $req, $opt{head}, @{ $opt{body} } ) };
+        if ($@) {
+            chomp($@);
+            last unless ( $try < $maxtry );
+            $sleep += $try;    # back off a little more on each retry
+            warn("$Prog: sleep($sleep): try#$try soap error: $@\n");
+            sleep($sleep);
+        }
+    }
+
+    if ( $handler && ( $@ || $resp->fault ) ) {
+        $handler->(
+            "$Prog: ERROR: $opt{req} (try #$try): ",
+            ( $@ || _err($resp) ), "\n"
+        );
+    }
+
+    return $resp;
+}
+
+# extract auth info from AuthResponse
+sub auth_info {
+    my %opt = @_;
+
+    my $resp  = $opt{resp};
+    my $sid   = $opt{sessionId} || $resp->valueof('//sessionId');
+    my $token = $opt{token} || $resp->valueof('//authToken');
+
+    Carp::confess("$Prog: no authToken found!\n")
+      unless ($token);
+
+    $sid ||= "";
+    warn("DEBUG: auth_info: sessionId($sid) authToken: $token\n")
+      if $DEBUG > 1;
+
+    my $ahdr = SOAP::Header->name(
+        "context" => \SOAP::Header->value(
+            SOAP::Header->name( "authToken" => $token ),
+            (
+                $sid
+                ? SOAP::Header->name("sessionId")->attr( { id => $sid } )
+                : ()
+            )
+        )
+    )->attr( { xmlns => NS_ZIMBRA } );
+
+    return { header => $ahdr, sessionId => $sid, token => $token };
+}
+
+# preparing user list:
+sub process_entry {
+    my ($line) = @_;
+
+    # ignore comments even with leading spaces
+    return if ( $line =~ s/^\s*(?:#|$)// );
+
+    # strip leading/trailing spaces
+    $line =~ s/^\s*//;
+    $line =~ s/\s*$//;
+
+    # ensure the smtp address is lower case
+    my $smtp = $line;
+    $smtp = lc($smtp) if defined($smtp);
+
+    return $smtp;
+}
+
+sub _chk_acct {
+    my ( $smtp, $ahash, $exclude ) = @_;
+
+    # warn about duplicate accounts
+    if ( exists( $ahash->{$smtp} ) ) {
+        warn("$Prog: warning: ignoring duplicate acct: $smtp\n");
+        return 0;
+    }
+
+    return undef if exists( $exclude->{$smtp} );
+
+    return $ahash->{$smtp} = 1;
+}
+
+sub load_accounts {
+    my $opt = ( ref( $_[0] ) eq "HASH" ) ? shift : {};
+    my @ds = @_;
+
+    # support excluding accounts
+    my %exclude = map { $_ => 1 } @{ $opt->{exclude} || [] };
+    my $exclcnt = 0;
+    my $ahash   = {};
+    my ( @accts, @alist, @files );
+
+    # separate account lists (arefs) from file names (strings)
+    foreach my $ds (@ds) {
+        next unless ( defined $ds );
+        ref($ds) ? push( @alist, @$ds ) : push( @files, $ds );
+    }
+
+    foreach my $acct (@alist) {
+        my $smtp = process_entry($acct);
+        my $rc = _chk_acct( $smtp, $ahash, \%exclude );
+        $exclcnt++ if ( !defined($rc) );
+        push( @accts, $smtp ) if ($rc);
+    }
+
+    foreach my $file (@files) {
+        my $fh = IO::File->new("< $file")
+          or die("$Prog: error: open($file) failed: $!\n");
+
+        while ( defined( my $line = <$fh> ) ) {
+            chomp($line);
+
+            # notice: we force $smtp to lowercase in process_entry
+            my $smtp = process_entry($line);
+
+            # warn about unexpected lines
+            unless ($smtp) {
+                warn("$Prog: warning: file '$file': skipping line: $_\n")
+                  unless ( $line =~ s/^\s*(?:#|$)// );
+                next;
+            }
+
+            my $rc = _chk_acct( $smtp, $ahash, \%exclude );
+            $exclcnt++ if ( !defined($rc) );
+            push( @accts, $smtp ) if ($rc);
+        }
+    }
+
+    warn("$Prog: note: $exclcnt account(s) excluded via exclude list(s)\n")
+      if ($exclcnt);
+
+    return \@accts;
+}
+
+# error handling in call_soap sub
+sub _err {
+    my ($resp) = @_;
+    Carp::confess("$Prog: no response object\n") unless ($resp);
+    return ( $resp->valueof('//Fault/Reason/Text') || "<unknown>" )
+      . ( $DEBUG > 1 ? ( ": " . Dumper( $resp->fault ) ) : "" );
+}
+
+# format: 02 Oct 2005 07:50:32 -0500 (EST)
+sub _ts {
+    return POSIX::strftime( "%d %b %Y %H:%M:%S %z (%Z)", localtime(time) );
+}
+
+sub _date {
+    my $dt = $_[0];
+    return POSIX::strftime( "%D %T", localtime($dt) );
+}
+
+__END__
+
+=head1 Input File Format
+
+The list of users to update can be read from the command line or via
+input files.  For the input file, blank lines, lines with only white
+space, and lines beginning with (optional whitespace) and then '#' are
+all skipped.
+
+Entries in the input file are simply in the format of one "user" per
+line, where user is in the format of "user@domain".
+
+Examples:
+
+  user1@dom1.name
+  user2@dom2.name
+  user3@dom3.name
+
+=head1 Performance
+
+Searching serially through mailboxes is likely to be slow.  Some
+attempts have been made to tune this utility to reduce run time where
+possible.  This section describes some of the tuning performed:
+
+=head2 SearchRequest limit
+
+The ZCS SearchRequest SOAP call provides paged results.  Below are
+timings with various values for 'limit'.
+
+Test mailbox with 16674 msgs.  A limit of 200 was chosen after these
+tests.
+
+ limit: timing via Benchmark
+ ------ --------------------
+   250: 238 wallclock secs (151.49 usr +  0.12 sys = 151.61 CPU)
+   225: 233 wallclock secs (137.40 usr +  0.10 sys = 137.50 CPU)
+   200: 227 wallclock secs (124.16 usr +  0.11 sys = 124.27 CPU)
+   150: 234 wallclock secs (98.25 usr +  0.13 sys = 98.38 CPU)
+   100: 282 wallclock secs (71.88 usr +  0.15 sys = 72.03 CPU)
+    75: 318 wallclock secs (59.26 usr +  0.17 sys = 59.43 CPU)
+    50: 445 wallclock secs (47.32 usr +  0.21 sys = 47.53 CPU)
+
+=head2 SearchDirectoryRequest limit
+
+The ZCS SearchDirectoryRequest SOAP call provides paged results.
+Below are timings with various values for 'limit' with 'maxResults'
+set to zero (0).
+
+Test directory with more than 83000 entries.  A limit of 50 was chosen
+after these tests.
+
+ limit: timing via time(1)
+ ------ --------------------
+   500: real 21m19.636s user 20m42.027s sys 0m0.395s
+   200: real  9m36.827s user  8m52.900s sys 0m0.717s
+   100: real  5m47.554s user  4m50.981s sys 0m0.769s
+    75: real  4m51.761s user  3m54.414s sys 0m0.799s
+    50: real  4m17.056s user  3m02.626s sys 0m1.246s
+    40: real  4m22.345s user  2m57.274s sys 0m1.530s
+
+=head1 BUGS/KNOWN ISSUES
+
+=over 4
+
+=item *
+
+'From' email address header information is not getting populated instantaneously
+for messages just sent/received before starting the utility.
+In such cases 'NA' is reported as 'from' header for first run. In rerun it 
+displays from address properly.
+IF utility run after some time (?? mins) after sending test messages, it gets 
+'from' details properly
+
+=back
+
+=cut
