@@ -10,9 +10,9 @@ THRESHOLD=80
 
 if [ "$CURRENT" -gt "$THRESHOLD" ] ; then
 
-DARI="from:report@imanudin.com";
-TUJUAN="to:monitoring@imanudin.com";
-SALINAN="cc:admin@imanudin.com";
+DARI="from:report@example.com";
+TUJUAN="to:monitoring@example.com";
+SALINAN="cc:admin@example.com";
 SERVER=`hostname -f`;
 KAPASITAS=`df -h`;
 SUBJECT="Subject: [PEMBERITAHUAN] : Kapasitas HDD $SERVER sudah mencapai $CURRENT%"
