@@ -12,9 +12,9 @@ STOPPED=`grep -woi "stopped" /tmp/status-$SRV.txt | uniq`;
 
 if [ "$NOTRUNNING" == "not running" -o "$STOPPED" == "Stopped" ] ; then
 
-DARI="from:report@imanudin.com";
-TUJUAN="to:admin.monitoring@imanudin.com";
-SALINAN="cc:admin@imanudin.com";
+DARI="from:report@example.com";
+TUJUAN="to:admin.monitoring@example.com";
+SALINAN="cc:admin@example.com";
 SERVER="$SRV";
 STATUS=`cat /tmp/status-$SRV.txt`;
 SUBJECT="Subject: [PEMBERITAHUAN] : Status $SERVER not Running atau Stopped"
