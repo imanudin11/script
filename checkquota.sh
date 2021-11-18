@@ -6,8 +6,8 @@ clear
 # Variable yang harus disesuaikan
 tanggal=`date +"%d-%b-%Y"`;
 attachment="quota-usage-report-$tanggal.csv";
-emailSender="quotareport@imanudin.net";
-emailRecipient="admin@imanudin.net";
+emailSender="quotareport@example.com";
+emailRecipient="admin@example.com";
 emailSubject="Quota usage report $tanggal";
 emailBody="Terlampir adalah laporan penggunaan quota per tanggal $tanggal";
 mtaServer="localhost";
