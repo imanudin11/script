@@ -129,9 +129,9 @@ if [ -z "$BLACKLIST" ]; then
 
 else
 
-DARI="from:report@imanudin.net";
-TUJUAN="to:admin@imanudin.net";
-SALINAN="cc:admin@imanudin.net";
+DARI="from:report@example.com";
+TUJUAN="to:admin@example.com";
+SALINAN="cc:admin@example.com";
 SUBJECT="Subject: IP Public Terblacklist pada RBL"
 BODY="
 Hi Team,
