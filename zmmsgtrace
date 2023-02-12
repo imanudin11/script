@@ -352,11 +352,11 @@ sub doit {
             my %ent;
             @ent{qw(log_date host app pid msg)} = ( $1, $2, $3, $4, $5 );
 
-            next unless ( $ent{app} and $ent{app} =~ /^(?:postfix|amavis)/ );
+            next unless ( $ent{app} and $ent{app} =~ /^(?:postfix|pmg-smtp-filter|amavis)/ );
 
             # ...: milter-discard: ...: ...; from=<> to=<> proto=... helo=<h>
             # postfix messages like /^$qid: key=value, .../
-            if (    $ent{app} =~ /^postfix/
+            if (    $ent{app} =~ /^(postfix|pmg-smtp-filter)/
                 and $ent{msg} =~ /^([A-F0-9]+|NOQUEUE): (.*)/ )
             {
                 my ( $qid, $msg ) = ( $1, $2 );
