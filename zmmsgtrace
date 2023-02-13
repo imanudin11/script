@@ -435,7 +435,7 @@ sub doit {
                     $obj->{prevIp}   = $2;
                 }
                 elsif ( $msg =~ /^from=<(.*)>, size=(\d+)/ ) {
-                    $obj->{sender} = $1 || "postmaster";
+                    $obj->{sender} = lc $1 || "postmaster";
                     $obj->{bytes} = $2;
                 }
 
@@ -448,7 +448,7 @@ sub doit {
                          status=(\S+) \s (.*)/x
                   )
                 {
-                    my $recip = $1;
+                    my $recip = lc $1;
                     my $ref   = $obj->{recipList}->{$recip};
                     unless ($ref) {
                         $ref = $obj->{recipList}->{$recip} = {};
