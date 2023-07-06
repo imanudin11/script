@@ -1,0 +1,1036 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use POSIX qw(errno_h signal_h);
+
+use Net::Server::PreForkSimple;
+use Net::DNS::Resolver;
+use Mail::SPF;
+use Fcntl;
+use Fcntl ':flock';
+use IO::Multiplex;
+use Time::HiRes qw(gettimeofday);
+use Time::Zone;
+
+use PVE::INotify;
+use PVE::Tools qw($IPV4RE $IPV6RE);
+use PVE::SafeSyslog;
+
+use PMG::Utils;
+use PMG::RuleDB;
+use PMG::DBTools;
+use PMG::RuleCache;
+use PMG::Config;
+use PMG::ClusterConfig;
+
+use base qw(Net::Server::PreForkSimple);
+
+my $greylist_delay = 3*60;            # greylist window
+my $greylist_lifetime = 3600*24*2;    # retry window
+my $greylist_awlifetime = 3600*24*36; # expire window
+
+my $opt_commandline = [$0, @ARGV];
+
+my $opt_max_dequeue = 1;
+my $opt_dequeue_time = 60*2;
+
+my $opt_testmode;
+my $opt_pidfile;
+my $opt_database;
+my $opt_policy_port = 10022;
+
+my %_opts = (
+    'pidfile=s' => \$opt_pidfile,
+    'testmode' => \$opt_testmode,
+    'database=s' => \$opt_database,
+    'port=i' => \$opt_policy_port,
+);
+if (!GetOptions(%_opts)) {
+    die "usage error\n";
+    exit (-1);
+}
+
+$opt_pidfile = "/run/pmgpolicy.pid" if !$opt_pidfile;
+$opt_max_dequeue = 0 if $opt_testmode;
+
+initlog('pmgpolicy', 'mail');
+
+my $max_servers = 5;
+
+if (!$opt_testmode) {
+
+    my $pmg_cfg = PMG::Config->new ();
+    my $demo = $pmg_cfg->get('admin', 'demo');
+    $max_servers = $pmg_cfg->get('mail', 'max_policy');
+
+    if ($demo) {
+	syslog('info', 'demo mode detected - not starting server');
+	exit(0);
+    }
+}
+
+my $daemonize = 1;
+if (defined ($ENV{BOUND_SOCKETS})) {
+    $daemonize = undef;
+}
+
+
+my $server_attr = {
+    port => [ $opt_policy_port ],
+    host => '127.0.0.1',
+    max_servers => $max_servers,
+    max_dequeue => $opt_max_dequeue,
+    check_for_dequeue => $opt_dequeue_time,
+    log_level => 3,
+    pid_file => $opt_pidfile,
+    commandline => $opt_commandline,
+    no_close_by_child => 1,
+    setsid => $daemonize,
+};
+
+my $database;
+if (defined($opt_database)) {
+    $database = $opt_database;
+} else {
+    $database = "Proxmox_ruledb";
+}
+
+$SIG{'__WARN__'} = sub {
+    my $err = $@;
+    my $t = $_[0];
+    chomp $t;
+    syslog('warning', "WARNING: %s", $t);
+    $@ = $err;
+};
+
+sub update_rbl_stats {
+    my ($dbh, $lcid) = @_;
+
+    my ($rbl_count, $pregreet_count) = PMG::Utils::scan_journal_for_rbl_rejects();
+    return if !$rbl_count && !$pregreet_count;
+
+    my $timezone = tz_local_offset();;
+    my $hour = int((time() + $timezone)/3600) * 3600;
+
+    my $sth = $dbh->prepare(
+	'INSERT INTO LocalStat (Time, RBLCount, PregreetCount, CID, MTime) ' .
+	'VALUES (?, ?, ?, ?, EXTRACT(EPOCH FROM now())) ' .
+	'ON CONFLICT (Time, CID) DO UPDATE SET ' .
+	'RBLCount = LocalStat.RBLCount + excluded.RBLCount, ' .
+	'PregreetCount = LocalStat.PregreetCount + excluded.PregreetCount, ' .
+	'MTime = excluded.MTime');
+
+    $sth->execute($hour, $rbl_count, $pregreet_count, $lcid);
+    $sth->finish();
+};
+
+sub run_dequeue {
+    my $self = shift;
+
+    $self->log(2, "starting policy database maintenance (greylist, rbl)");
+
+    my $cinfo = PMG::ClusterConfig->new();
+    my $lcid = $cinfo->{local}->{cid};
+    my $role = $cinfo->{local}->{type} // '-';
+
+    my $dbh;
+
+    eval {
+	$dbh = PMG::DBTools::open_ruledb($database);
+    };
+    my $err = $@;
+
+    if ($err) {
+	$self->log(0, "ERROR: $err");
+	return;
+    }
+
+    my ($csec, $usec) = gettimeofday ();
+
+    eval { update_rbl_stats($dbh, $lcid); };
+    $err = $@;
+
+    my ($csec_end, $usec_end) = gettimeofday ();
+    my $rbltime = int (($csec_end-$csec)*1000 + ($usec_end - $usec)/1000);
+    ($csec, $usec) = ($csec_end, $usec_end);
+
+    if ($err) {
+	$self->log(0, "rbl update error: $err");
+	# continue;
+    }
+
+    my $now = time();
+
+    my $ecount = 0;
+
+    eval {
+
+	$dbh->begin_work;
+
+	# we do not lock the table here to avoid delays
+	# but that is OK, because we only touch expired records
+	# which do not change nornmally
+	## $dbh->do ("LOCK TABLE CGreylist IN ROW EXCLUSIVE MODE");
+
+	# move expired and undelivered records from Greylist to Statistic
+
+	my $rntxt = '';
+	if (!$lcid) {
+	    $rntxt = "AND CID = 0";
+	} else {
+	    if ($role eq 'master') {
+		# master is responsible for all non-cluster (deleted) nodes
+		foreach my $rcid (@{$cinfo->{remnodes}}) {
+		    $rntxt .= $rntxt ? " AND CID != $rcid" : "AND (CID != $rcid";
+		}
+		$rntxt .= ")" if $rntxt;
+	    } else {
+		$rntxt = "AND (CID = 0 OR CID = $lcid)";
+	    }
+	}
+
+
+	my $cmds = '';
+
+	my $sth = $dbh->prepare(
+	    "SELECT distinct instance, sender FROM CGreylist " .
+	    "WHERE passed = 0 AND extime < ? $rntxt");
+
+	$sth->execute ($now);
+
+
+	while (my $ref = $sth->fetchrow_hashref()) {
+	    my $sth2 = $dbh->prepare(
+		"SELECT * FROM CGreylist WHERE instance = ? AND sender = ?");
+	    $sth2->execute ($ref->{instance}, $ref->{sender});
+	    my $rctime;
+	    my @rcvrs;
+	    my $bc = 0;
+
+	    while (my $ref2 = $sth2->fetchrow_hashref()) {
+		$rctime = $ref2->{rctime} if !$rctime;
+		$bc += $ref2->{blocked};
+		push  @rcvrs, $ref2->{receiver};
+	    }
+
+	    $sth2->finish();
+
+	    # hack: sometimes query sth2 does not return anything - maybe a
+	    # postgres bug? We simply ignore (when rctime is undefined) it
+	    # to avoid problems.
+
+	    if ($rctime) {
+		$cmds .=  "SELECT nextval ('cstatistic_id_seq');" .
+		    "INSERT INTO CStatistic " .
+		    "(CID, RID, ID, Time, Bytes, Direction, Spamlevel, VirusInfo, PTime, Sender) VALUES (" .
+		    "$lcid, currval ('cstatistic_id_seq'), currval ('cstatistic_id_seq'), ";
+
+		my $sl = $bc >= 100000 ? 4 : 5;
+		$cmds .= $rctime . ", 0, '1', $sl, NULL, 0, ";
+		$cmds .= $dbh->quote ($ref->{sender}) . ');';
+
+		foreach my $r (@rcvrs) {
+		    my $tmp = $dbh->quote ($r);
+		    $cmds .= "INSERT INTO CReceivers (CStatistic_CID, CStatistic_RID, Receiver, Blocked) ".
+			"VALUES ($lcid, currval ('cstatistic_id_seq'), $tmp, '1'); ";
+		}
+	    }
+
+	    if (length ($cmds) > 100000) {
+		$dbh->do ($cmds);
+		$cmds = '';
+	    }
+
+	    $ecount++;
+
+	    # this produces too much log traffic
+	    # my $targets = join (", ", @rcvrs);
+	    #my $msg = "expire mail $ref->{instance} from $ref->{sender} to $targets";
+	    #$self->log (0, $msg);
+	}
+
+	$dbh->do ($cmds) if $cmds;
+
+	$sth->finish();
+
+	if ($ecount > 0) {
+	    my $msg = "found $ecount expired mails in greylisting database";
+	    $self->log (0, $msg);
+	}
+
+	$dbh->do ("DELETE FROM CGreylist WHERE extime < $now");
+
+	$dbh->commit;
+    };
+    $err = $@;
+
+    ($csec_end, $usec_end) = gettimeofday ();
+    my $ptime = int (($csec_end-$csec)*1000 + ($usec_end - $usec)/1000);
+
+    if ($err) {
+	$dbh->rollback if $dbh;
+	$self->log(0, "greylist database update error: $err");
+    }
+
+    $self->log(2, "end policy database maintenance ($rbltime ms, $ptime ms)");
+
+    $dbh->disconnect() if $dbh;
+}
+
+sub pre_loop_hook {
+    my $self = shift;
+
+    my $prop = $self->{server};
+
+    $prop->{log_level} = 3;
+
+    $self->log(0, "Policy daemon (re)started");
+
+    $SIG{'USR1'} = sub {
+	# reloading server configuration
+	if (defined $prop->{children}) {
+	    foreach my $pid (keys %{$prop->{children}}) {
+		kill(10, $pid); # SIGUSR1 children
+	    }
+	}
+    };
+
+    my $sig_set = POSIX::SigSet->new;
+    $sig_set->addset (&POSIX::SIGHUP);
+    $sig_set->addset (&POSIX::SIGCHLD);
+    my $old_sig_set = POSIX::SigSet->new();
+
+    sigprocmask (SIG_UNBLOCK, $sig_set, $old_sig_set);
+}
+
+sub load_config {
+    my $self = shift;
+
+    my $prop = $self->{server};
+
+    if ($self->{ruledb}) {
+	$self->log(0, "reloading configuration $database");
+	$self->{ruledb}->close();
+    }
+
+    my $pmg_cfg = PMG::Config->new ();
+    $self->{use_spf} = $pmg_cfg->get('mail', 'spf');
+    $self->{use_greylist} = $pmg_cfg->get('mail', 'greylist');
+    $self->{use_greylist6} = $pmg_cfg->get('mail', 'greylist6');
+    $self->{greylistmask4} = $pmg_cfg->get('mail', 'greylistmask4');
+    $self->{greylistmask6} = $pmg_cfg->get('mail', 'greylistmask6');
+
+    if ($opt_testmode) {
+	$self->{use_spf} = 1;
+	$self->{use_greylist} = 1;
+	$self->{use_greylist6} = 1;
+    }
+
+    my $nodename = PVE::INotify::nodename();
+    $self->{fqdn} = PVE::Tools::get_fqdn($nodename);
+
+    my $cinfo = PMG::ClusterConfig->new();
+    my $lcid = $cinfo->{local}->{cid};
+    $self->{cinfo} = $cinfo;
+    $self->{lcid} = $lcid;
+
+    my $dbh;
+
+    eval {
+	$dbh = PMG::DBTools::open_ruledb($database);
+	$self->{ruledb} = PMG::RuleDB->new($dbh);
+	$self->{rulecache} = PMG::RuleCache->new($self->{ruledb});
+    };
+    if (my $err = $@) {
+	$self->log(0, "ERROR: unable to load database : $err");
+    }
+
+    $self->{reload_config} = 0;
+}
+
+sub child_init_hook {
+    my $self = shift;
+
+    my $prop = $self->{server};
+
+    $0 = 'pmgpolicy child';
+
+    setup_fork_signal_mask(0); # unblocking signals for children
+
+    eval {
+	$self->load_config();
+
+	$self->{mux} = IO::Multiplex->new();
+	$self->{mux}->set_callback_object($self);
+
+	my %dnsargs = (
+	    tcp_timeout => 3,
+	    udp_timeout => 3,
+	    retry => 1,
+	    retrans => 0,
+	    dnsrch => 0,
+	    defnames => 0,
+	    );
+
+	if ($opt_testmode) {
+	    # $dnsargs{nameservers} = [ qw (213.129.232.1 213.129.226.2) ];
+	}
+
+	$self->{dns_resolver} = Net::DNS::Resolver->new(%dnsargs);
+
+	$self->{spf_server} = Mail::SPF::Server->new(
+	    hostname => $self->{fqdn}, dns_resolver => $self->{dns_resolver},
+	    default_authority_explanation => 'Rejected by SPF: %{C} is not a designated mailserver for %{S} (context %{_scope}, on %{R})');
+    };
+    if (my $err = $@) {
+	$self->log(0, $err);
+	$self->child_finish_hook;
+	exit(-1);
+    }
+
+    $SIG{'USR1'} = sub {
+	$self->{reload_config} = 1;
+    }
+}
+
+sub child_finish_hook {
+    my $self = shift;
+
+    my $prop = $self->{server};
+
+    $self->{ruledb}->close() if $self->{ruledb};
+}
+
+sub get_spf_result {
+    my ($self, $instance, $ip, $helo, $sender) = @_;
+
+    my $result;
+    my $spf_header;
+    my $local_expl;
+    my $auth_expl;
+
+    # we only use helo tests when we have no sender,
+    # helo is sometimes empty, so we can't use SPF helo tests
+    # in that case - strange
+    if ($helo && !$sender) {
+	my $query;
+
+	if (defined ($self->{cache}->{$instance}) &&
+	    defined ($self->{cache}->{$instance}->{spf_helo_result})) {
+
+	    $query = $self->{cache}->{$instance}->{spf_helo_result};
+
+	} else {
+	    my $request = Mail::SPF::Request->new(
+		scope => 'helo', identity => $helo, ip_address => $ip);
+
+	    $query = $self->{cache}->{$instance}->{spf_helo_result} =
+		$self->{spf_server}->process ($request);
+	}
+
+	$result = $query->code;
+	$spf_header = $query->received_spf_header;
+	$local_expl = $query->local_explanation;
+	$auth_expl = $query->authority_explanation if $query->is_code('fail') || $query->is_code('softfail');
+
+	# return if we get a definitive result
+	if ($result eq 'pass' || $result eq 'fail' || $result eq 'temperror') {
+	    return ($result, $spf_header, $local_expl, $auth_expl);
+	}
+    }
+
+    if ($sender) {
+
+	my $query;
+
+	if (defined ($self->{cache}->{$instance}) &&
+	    defined ($self->{cache}->{$instance}->{spf_mfrom_result})) {
+
+	    $query = $self->{cache}->{$instance}->{spf_mfrom_result};
+
+	} else {
+
+	    my $request = Mail::SPF::Request->new(
+		scope => 'mfrom', identity => $sender,
+		ip_address => $ip, helo_identity => $helo);
+
+	    $query = $self->{cache}->{$instance}->{spf_mfrom_result} =
+		$self->{spf_server}->process($request);
+	}
+
+	$result = $query->code;
+	$spf_header = $query->received_spf_header;
+	$local_expl = $query->local_explanation;
+	$auth_expl = $query->authority_explanation if $query->is_code('fail') || $query->is_code('softfail');
+
+	return ($result, $spf_header, $local_expl, $auth_expl);
+    }
+
+    return undef;
+}
+
+sub is_backup_mx {
+    my ($self, $ip, $receiver) = @_;
+
+    my ($rdomain) = $receiver =~ /([^@]+)$/;
+
+    my $dkey = "BKMX:$rdomain";
+
+    if (defined ($self->{cache}->{$dkey}) &&
+	($self->{cache}->{$dkey}->{status} == 1)) {
+	return $self->{cache}->{$dkey}->{$ip};
+    }
+
+    my $resolver = $self->{dns_resolver};
+
+    if (my $mx = $resolver->send($rdomain, 'MX')) {
+	$self->{cache}->{$dkey}->{status} = 1;
+	my @mxa = grep { $_->type eq 'MX' } $mx->answer;
+	my @mxl = sort { $a->preference <=> $b->preference } @mxa;
+	# shift @mxl; # optionally skip primary MX ?
+	foreach my $rr (@mxl) {
+	    my $a = $resolver->send ($rr->exchange, 'A');
+	    if ($a) {
+		foreach my $rra ($a->answer) {
+		    if ($rra->type eq 'A') {
+			$self->{cache}->{$dkey}->{$rra->address} = 1;
+		    }
+		}
+	    }
+	}
+    } else {
+	$self->{cache}->{$dkey}->{status} = 0;
+    }
+
+    return $self->{cache}->{$dkey}->{$ip};
+}
+
+sub greylist_value {
+    my ($self, $ctime, $helo, $ip, $sender, $rcpt, $instance) = @_;
+
+    my $rulecache = $self->{rulecache};
+
+    my $dbh = $self->{ruledb}->{dbh};
+
+    # try to reconnect if database connection is broken
+    if (!$dbh->ping) {
+	$self->log(0, 'Database connection broken - trying to reconnect');
+	my $dbh;
+	eval {
+	    $dbh = PMG::DBTools::open_ruledb($database);
+	};
+	my $err = $@;
+	if ($err) {
+	    $self->log(0, "unable to reconnect to database server: $err");
+	    return 'dunno';
+	}
+	$self->{ruledb} = PMG::RuleDB->new($dbh);
+    }
+
+    # some sender substitutions
+    my ($user, $domain) = split('@', $sender, 2);
+    if (defined ($user) && defined ($domain)) {
+	# see http://cr.yp.to/proto/verp.txt
+	$user =~ s/\+.*//; # strip extensions  (mailing-list VERP)
+	$user =~ s/\b\d+\b/#/g; #replace numbers in VERP address
+	$sender = "$user\@$domain";
+    }
+
+    if ($self->is_backup_mx($ip, $rcpt)) {
+	$self->log(3, "accept mails from backup MX host - $ip");
+	return 'dunno';
+    }
+
+    # greylist exclusion (sender whitelist)
+    if ($rulecache->greylist_match ($sender, $ip)) {
+	$self->log(3, "accept mails from whitelist - $ip");
+	return 'dunno';
+    }
+
+    # greylist exclusion (receiver whitelist)
+    if ($rulecache->greylist_match_receiver ($rcpt)) {
+	$self->log(3, "accept mails to whitelist - <$rcpt>");
+	return 'dunno';
+    }
+
+    my $masklen;
+    my $do_greylist = 0;
+    if ($ip =~ m/$IPV4RE/) {
+	$masklen = $self->{greylistmask4};
+	$do_greylist = $self->{use_greylist};
+    } elsif ($ip =~ m/$IPV6RE/) {
+	$masklen = $self->{greylistmask6};
+	$do_greylist = $self->{use_greylist6};
+    } else {
+	return 'dunno';
+    }
+
+    my $spf_header;
+
+    if ((!$opt_testmode && $self->{use_spf}) ||
+	($opt_testmode && ($rcpt =~ m/^testspf/))) {
+
+	# ask SPF
+ 	my $spf_result;
+	my $local_expl,
+	my $auth_expl;
+
+	my $previous_alarm;
+
+	my ($result, $smtp_comment, $header_comment);
+
+	eval {
+	    $previous_alarm = alarm(10);
+	    local $SIG{ALRM} = sub { die "SPF timeout\n" };
+
+	    ($result, $spf_header, $local_expl, $auth_expl) =
+		$self->get_spf_result($instance, $ip, $helo, $sender);
+
+	    alarm(0); # avoid race condition
+	};
+	my $err = $@;
+
+	alarm($previous_alarm) if defined($previous_alarm);
+
+	if ($err) {
+            $err = $err->text if UNIVERSAL::isa ($err, 'Mail::SPF::Exception');
+	    $self->log (0, $err);
+	} else {
+
+	    if ($result && $result eq 'pass') {
+		$self->log(3, "SPF says $result");
+		$spf_result = $spf_header ? "prepend $spf_header" : 'dunno';
+	    }
+	    if ($result && $result eq 'softfail') {
+		$self->log(3, "SPF says $result");
+		$spf_result = "reject ${auth_expl} (SPF $result)";
+	    }
+	    
+	    if ($result && $result eq 'none') {
+		$self->log(3, "SPF says $result");
+		$spf_result = "reject you do not have SPF records (SPF $result)";
+	    }
+
+	    if ($result && $result eq 'fail') {
+		$self->log(3, "SPF says $result");
+		$spf_result = "reject ${auth_expl} (SPF $result)";
+
+		eval {
+
+		    $dbh->begin_work;
+
+		    # try to avoid locks everywhere - we use merge instead of insert
+		    #$dbh->do ("LOCK TABLE CGreylist IN ROW EXCLUSIVE MODE");
+
+		    # check if there is already a record in the GL database
+		    my $sth = $dbh->prepare(
+			"SELECT * FROM CGreylist " .
+			"WHERE IPNet::cidr = network(set_masklen(?, ?)) AND ".
+			"Sender = ? AND Receiver = ?");
+
+		    $sth->execute($ip, $masklen, $sender, $rcpt);
+		    my $ref = $sth->fetchrow_hashref();
+		    $sth->finish();
+
+		    # else add an entry to the GL Database with short
+		    # expiration time. run_dequeue() moves those entries into the statistic
+		    # table later. We set 'blocked' to 100000 to identify those entries.
+
+		    if (!defined($ref->{rctime})) {
+			$dbh->do(PMG::DBTools::cgreylist_merge_sql(1), undef,
+				 $ip, $masklen, $sender, $rcpt, $instance,
+				 $ctime, $ctime + 10, 0, 100000, 0, $ctime, $self->{lcid});
+		    }
+
+		    $dbh->commit;
+		};
+		if (my $err = $@) {
+		    $dbh->rollback;
+		    $self->log(0, $err);
+		}
+	    }
+	}
+
+	return $spf_result if $spf_result;
+    }
+
+
+    my $res = 'dunno';
+
+    # add spf_header once - SA can re-use this information
+    if (!defined($self->{cache}->{$instance}) ||
+	!$self->{cache}->{$instance}->{spf_header_added}) {
+	$res = "prepend $spf_header" if $spf_header;
+	$self->{cache}->{$instance}->{spf_header_added} = 1;
+    }
+
+    return $res if !$do_greylist;
+
+    my $defer_res = "defer_if_permit Service is unavailable (try later)";
+
+    eval {
+
+	# we don't use alarm here, because it does not work with DBI
+
+	$dbh->begin_work;
+
+	# try to avoid locks everywhere - we use merge instead of insert
+	#$dbh->do ("LOCK TABLE CGreylist IN ROW EXCLUSIVE MODE");
+
+	my $sth = $dbh->prepare(
+	    "SELECT * FROM CGreylist " .
+	    "WHERE IPNet::cidr = network(set_masklen(?, ?)) AND ".
+	    "Sender = ? AND Receiver = ?");
+
+	$sth->execute($ip, $masklen, $sender, $rcpt);
+
+	my $ref = $sth->fetchrow_hashref();
+
+	$sth->finish();
+
+	if (!defined($ref->{rctime})) {
+
+	    $dbh->do(
+		PMG::DBTools::cgreylist_merge_sql(1), undef, $ip, $masklen,
+		$sender, $rcpt, $instance, $ctime, $ctime + $greylist_lifetime,
+		0, 1, 0, $ctime, $self->{lcid}
+	    );
+
+	    $res = $defer_res;
+	    $self->log(3, "defer greylisted mail");
+	} else {
+	    my $age = $ctime - $ref->{rctime};
+
+	    if ($age < $greylist_delay) {
+		# defer (resent within greylist_delay window)
+		$res = $defer_res;
+		$self->log(3, "defer greylisted mail");
+		$dbh->do(
+		    "UPDATE CGreylist " .
+		    "SET Blocked = Blocked + 1, MTime = ? " .
+		    "WHERE IPNet::cidr = network(set_masklen(?, ?)) ".
+		    " AND Sender = ? AND Receiver = ?", undef,
+		    $ctime, $ip, $masklen, $sender, $rcpt
+		);
+	    } else {
+		if ($ctime < $ref->{extime}) {
+		    # accept (not expired)
+		    my $lifetime = $sender eq "" ? 0 : $greylist_awlifetime;
+		    my $delay = $ref->{passed} ? "" : "Delay = $age, ";
+		    $dbh->do(
+			"UPDATE CGreylist " .
+			"SET Passed = Passed + 1, $delay ExTime = ?, MTime = ? " .
+			"WHERE IPNet::cidr = network(set_masklen(?, ?)) ".
+			" AND Sender = ? AND Receiver = ?", undef,
+			$ctime + $lifetime, $ctime, $ip, $masklen, $sender, $rcpt
+		    );
+		} else {
+		    # defer (record is expired)
+		    $res = $defer_res;
+		    $dbh->do(
+			"UPDATE CGreylist " .
+			"SET RCTime = ?, ExTime = ?, MTime = ?, Instance = ?, " .
+			"Blocked = 1, Passed = 0 " .
+			"WHERE IPNet::cidr = network(set_masklen(?, ?)) ".
+			" AND Sender = ? AND Receiver = ?", undef,
+			$ctime, $ctime + $greylist_lifetime, $ctime, $instance,
+			$ip, $masklen, $sender, $rcpt
+		    );
+		}
+	    }
+	}
+
+        $dbh->commit;
+    };
+    if (my $err = $@) {
+	$dbh->rollback;
+	$self->log (0, $err);
+    }
+
+    return $res;
+}
+
+# shutdown connections: we need this - else file handles are
+# not closed and we run out of handles
+sub mux_eof {
+    my ($self, $mux, $fh) = @_;
+
+    $mux->shutdown($fh, 1);
+}
+
+
+my $last_reload_test = 0;
+my $last_confid_version;
+my (undef, $pmgconffilename) = PVE::INotify::ccache_info('pmg.conf');
+sub test_config_version {
+
+    my $ctime = time();
+
+    if (($ctime - $last_reload_test) < 5) { return 0; }
+
+    $last_reload_test = $ctime;
+
+    my $version = PVE::INotify::poll_changes($pmgconffilename);
+
+    if (!defined($last_confid_version) ||
+	$last_confid_version != $version) {
+	$last_confid_version = $version;
+	return 1;
+    }
+
+    return 0;
+}
+
+sub mux_input {
+    my ($self, $mux, $fh, $dataref) = @_;
+    my $prop = $self->{server};
+
+    my $attribute = {};
+
+    eval {
+	$self->{reload_config} = 1 if test_config_version();
+	$self->load_config() if $self->{reload_config};
+
+	while ($$dataref =~ s/^([^\r\n]*)\r?\n//) {
+	    my $line = $1;
+	    next if !defined ($line);
+
+	    if ($line =~ m/([^=]+)=(.*)/) {
+		$attribute->{substr($1, 0, 255)} = substr($2, 0, 255);
+	    } elsif ($line eq '') {
+		my $res = 'dunno';
+		my $ctime = time;
+
+		if ($opt_testmode) {
+		    die "undefined test time :ERROR" if !defined $attribute->{testtime};
+		    $ctime = $attribute->{testtime};
+		}
+
+		if ($attribute->{instance} && $attribute->{recipient} &&
+		    $attribute->{client_address} && $attribute->{request} &&
+		    $attribute->{request} eq 'smtpd_access_policy') {
+
+		    eval {
+
+			$res = $self->greylist_value(
+			    $ctime,
+			    lc ($attribute->{helo_name}),
+			    lc ($attribute->{client_address}),
+			    lc ($attribute->{sender}),
+			    lc ($attribute->{recipient}),
+			    lc ($attribute->{instance}));
+		    };
+		    if (my $err = $@) {
+			$self->log(0, $err);
+		    }
+		}
+
+		print $fh "action=$res\n\n";
+
+		$attribute = {};
+	    } else {
+		$self->log(0, "greylist policy protocol error - got '%s'", $line);
+	    }
+	}
+    };
+    my $err = $@;
+
+    # remove remaining data, if any
+    if ($$dataref ne '') {
+	$self->log(0, "greylist policy protocol error - unused data '%s'", $$dataref);
+	$$dataref = '';
+    }
+
+    $self->log(0, $err) if $err;
+}
+
+sub restart_close_hook {
+    my $self = shift;
+
+    my $sig_set = POSIX::SigSet->new;
+    $sig_set->addset(&POSIX::SIGHUP);
+    $sig_set->addset(&POSIX::SIGCHLD); # to avoid zombies
+    my $old_sig_set = POSIX::SigSet->new();
+
+    sigprocmask(SIG_BLOCK, $sig_set, $old_sig_set);
+}
+
+sub pre_server_close_hook {
+    my $self = shift;
+
+    my $prop = $self->{server};
+
+    if (defined $prop->{_HUP}) {
+	undef $prop->{pid_file_unlink};
+    }
+
+    if (defined $prop->{children}) {
+	foreach my $pid (keys %{$prop->{children}}) {
+	    kill(1, $pid); # HUP children
+	}
+    }
+
+    # nicely shutdown children (give them max 30 seconds to shut down)
+    my $previous_alarm = alarm(30);
+    eval {
+	local $SIG{ALRM} = sub { die "Timed Out!\n" };
+
+	my $pid;
+	1 while ((($pid = waitpid(-1, 0)) > 0) || ($! == EINTR));
+
+	alarm(0); # avoid race
+    };
+    alarm ($previous_alarm);
+}
+
+sub setup_fork_signal_mask {
+    my $block = shift;
+
+    my $sig_set = POSIX::SigSet->new;
+    $sig_set->addset(&POSIX::SIGINT);
+    $sig_set->addset(&POSIX::SIGTERM);
+    $sig_set->addset(&POSIX::SIGQUIT);
+    $sig_set->addset(&POSIX::SIGHUP);
+    my $old_sig_set = POSIX::SigSet->new();
+
+    if ($block) {
+	sigprocmask (SIG_BLOCK, $sig_set, $old_sig_set);
+    } else {
+	sigprocmask (SIG_UNBLOCK, $sig_set, $old_sig_set);
+    }
+}
+
+# subroutine to start up a specified number of children.
+# We need to block signals until handlers are set up correctly.
+# Else its possible that HUP occurs after fork, which triggers
+# signal TERM at children and calls server_close() instead of
+# simply exit the child.
+# Note: on server startup signals are setup to trigger
+# asynchronously for a short period of time (in PreForkSimple]::loop,
+# run_n_children is called before run_parent)
+# Net::Server::PreFork does not have this problem, because it is using
+# signal HUP stop children
+sub run_n_children {
+    my ($self, $n)  = @_;
+
+    my $prop  = $self->{server};
+
+    setup_fork_signal_mask(1); # block signals
+
+    $self->SUPER::run_n_children($n);
+
+    setup_fork_signal_mask(0); # unblocking signals for parent
+}
+
+# test sig_hup with: for ((;;)) ;do kill -HUP  `cat /run/pmgpolicy.pid`; done;
+# wrapper to avoid multiple calls to sig_hup
+sub sig_hup {
+    my $self = shift;
+
+    my $prop = $self->{server};
+
+    return if defined($prop->{_HUP}); # do not call twice
+
+    $self->SUPER::sig_hup();
+}
+
+### child process which will accept on the port
+sub run_child {
+    my $self = shift;
+
+    my $prop = $self->{server};
+
+    $self->log(4, "Child Preforked ($$)\n");
+
+    # set correct signal handlers before enabling signals again
+    $SIG{INT} = $SIG{TERM} = $SIG{QUIT} = $SIG{HUP} = sub {
+	$self->child_finish_hook;
+	exit;
+    };
+
+    delete $prop->{children};
+
+    $self->child_init_hook;
+
+    # accept connections
+
+    my $sock = $prop->{sock}->[0];
+
+    # make sure we got a good sock
+    if (!defined ($sock)){
+	$self->log(0, "ERROR: Received a bad socket");
+	exit (-1);
+    }
+
+    # sometimes the socket is not usable, don't know why
+    my $flags = fcntl($sock, F_GETFL, 0);
+    if (!$flags) {
+	$self->log(0, "socket not ready - $!");
+	exit (-1);
+    }
+
+    # cache is limited, because postfix does max. 100 queries
+    $self->{cache} = {};
+
+    eval {
+	my $mux = $self->{mux};
+	$mux->listen ($sock);
+	$mux->loop;
+    };
+    if (my $err = $@) {
+	$self->log(0, "ERROR: $err");
+    }
+
+    $self->child_finish_hook;
+
+    exit;
+}
+
+my $syslog_map = {
+    0 => 'err',
+    1 => 'warning',
+    2 => 'notice',
+    3 => 'info',
+    4 => 'debug'
+};
+
+sub log {
+    my ($self, $level, $msg, @therest) = @_;
+
+    my $prop = $self->{server};
+
+    return if $level =~ /^\d+$/ && $level > $prop->{log_level};
+
+    $level = $syslog_map->{$level} || $level;
+    if (@therest) {
+        syslog($level, $msg, @therest);
+    } else {
+	syslog ($level, $msg);
+    }
+}
+
+my $server = bless {
+    server => $server_attr,
+};
+
+$server->sig_chld(); # avoid zombies after restart
+
+$server->run ();
+
+exit (0);
+
+__END__
+
+=head1 NAME
+
+pmgpolicy - The Proxmox policy daemon
+
+=head1 SYNOPSIS
+
+pmgpolicy
+
+=head1 DESCRIPTION
+
+Documentation is available at www.proxmox.com
